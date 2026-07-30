@@ -4,8 +4,9 @@ Jupiter Predict — BTC Up or Down 5m Bot
 
 Strategy:
   • Monitor live "Bitcoin Up/Down (5m)" markets on Jupiter Forecast (provider=bisonfi)
-  • Record BTC spot price at market open  →  that's the "price to beat"
-  • In the LAST 1 SECOND of the round, poll BTC spot price every 250ms:
+  • Capture BTC spot price at market open (beginAt)  →  that's the "price to beat"
+  • Poll every 3 seconds and log: spot, price-to-beat, diff, time remaining
+  • In the LAST 1 SECOND of the round, poll faster (250ms):
       - If spot >= price_to_beat + $5  →  BUY UP   (100% of USDC balance)
       - If spot <= price_to_beat - $5  →  BUY DOWN (100% of USDC balance)
       - Otherwise  →  skip this round
@@ -18,11 +19,9 @@ Resolution:     Chainlink BTC/USD data stream (per market rules)
 """
 
 import os
-import re
 import time
 import base64
 import asyncio
-from datetime import datetime, timezone
 
 import httpx
 from solders.keypair import Keypair
@@ -33,7 +32,8 @@ JUPITER_API_KEY   = os.environ["JUPITER_API_KEY"]
 WALLET_PRIVKEY    = os.environ["WALLET_PRIVKEY"]
 SOLANA_RPC        = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 THRESHOLD_USD     = 5.0       # $5 deviation triggers entry
-POLL_INTERVAL     = 0.25      # seconds between spot-price polls in entry window
+POLL_INTERVAL     = 0.25      # seconds between polls in the final entry window
+REFRESH_INTERVAL  = 3.0       # seconds between status logs during the round
 ENTRY_WINDOW_SEC  = 1.0       # enter only inside last N seconds of round
 
 # wBTC mint on Solana — Jupiter Price v3 returns real BTC USD price for this
@@ -54,7 +54,6 @@ OWNER_PUBKEY = str(keypair.pubkey())
 print(f"[WALLET] {OWNER_PUBKEY}")
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
-# Track which market we've already traded and the opening price
 traded_markets: set[str] = set()
 price_to_beat: float | None = None
 
@@ -63,9 +62,7 @@ price_to_beat: float | None = None
 async def get_btc_5m_market(client: httpx.AsyncClient) -> dict | None:
     """
     Fetch the current Bitcoin Up/Down 5m market from Jupiter Forecast.
-    Returns the event dict or None.
-
-    Uses regex to match "(5m)" exactly — NOT "(15m)" which also contains "5m".
+    Uses tags array for exact "5m" match — avoids matching "15m".
     """
     r = await client.get(
         f"{JUP_PREDICT_BASE}/events",
@@ -81,10 +78,10 @@ async def get_btc_5m_market(client: httpx.AsyncClient) -> dict | None:
     events = data.get("data", [])
 
     for event in events:
-        meta = event.get("metadata", {})
-        title = meta.get("title", "")
-        series = meta.get("series", "")
-        if series == "btc" and re.search(r'\(5m\)', title, re.IGNORECASE):
+        tags = event.get("tags", [])
+        series = event.get("metadata", {}).get("series", "")
+        # Exact match: tags must contain "5m" (not "15m")
+        if series == "btc" and "5m" in tags:
             return event
     return None
 
@@ -96,6 +93,17 @@ async def get_btc_spot(client: httpx.AsyncClient) -> float:
     data = r.json()
     price = data[WBTC_MINT]["usdPrice"]
     return float(price)
+
+
+async def get_market_prices(client: httpx.AsyncClient, market_id: str) -> dict | None:
+    """Get current orderbook prices for a market."""
+    r = await client.get(
+        f"{JUP_PREDICT_BASE}/orderbook/{market_id}",
+        headers=HEADERS,
+    )
+    if r.status_code != 200:
+        return None
+    return r.json()
 
 
 async def get_usdc_balance(client: httpx.AsyncClient) -> int:
@@ -124,13 +132,10 @@ async def place_order(
     is_up: bool,
     amount_micro: int,
 ) -> str | None:
-    """
-    Place a market buy order via Jupiter Predict API.
-    Returns order pubkey on success, None on failure.
-    """
+    """Place a market buy order via Jupiter Predict API."""
     body = {
         "marketId": market_id,
-        "outcome": "YES",          # buying YES shares for the chosen side
+        "outcome": "YES",
         "isBuy": True,
         "depositAmount": str(amount_micro),
         "ownerPubkey": OWNER_PUBKEY,
@@ -195,6 +200,7 @@ async def main():
                 meta      = event.get("metadata", {})
                 event_id  = event.get("eventId", "")
                 title     = meta.get("title", "")
+                begin_at  = int(event.get("beginAt", 0))    # unix seconds — window start
                 markets   = event.get("markets", [])
 
                 # Find UP and DOWN market objects
@@ -206,52 +212,73 @@ async def main():
                     await asyncio.sleep(5)
                     continue
 
-                # Use UP market's timing (both share the same window)
-                close_time = up_market.get("closeTime")  # unix seconds
-                open_time  = up_market.get("openTime")   # unix seconds
+                close_time = up_market.get("closeTime")   # unix seconds
+                open_time  = up_market.get("openTime")     # unix seconds
 
                 # Already traded this market?
                 if event_id in traded_markets:
                     secs_left = close_time - time.time()
-                    wait = max(secs_left + 3, 2)
-                    print(f"[SKIP] Already traded {event_id}. Waiting {wait:.0f}s for next round.")
-                    await asyncio.sleep(min(wait, 10))
+                    if secs_left > 0:
+                        await asyncio.sleep(min(secs_left + 3, 10))
                     continue
 
-                # ── Capture price-to-beat when market first appears ───────────
-                now_ts = time.time()
+                # ── Capture price-to-beat at market open ───────────────────────
                 if price_to_beat is None:
+                    now_ts = time.time()
+
+                    # Wait for market to actually open if it hasn't yet
+                    if begin_at > now_ts:
+                        wait_sec = begin_at - now_ts
+                        print(f"[NEW ROUND] {title}  event={event_id}")
+                        print(f"  market opens in {wait_sec:.1f}s — waiting…")
+                        await asyncio.sleep(max(wait_sec, 0.1))
+
+                    # Capture BTC spot price as price-to-beat at window start
                     price_to_beat = await get_btc_spot(client)
                     print(f"[NEW ROUND] {title}")
                     print(f"  event={event_id}")
                     print(f"  price_to_beat=${price_to_beat:,.2f}")
                     print(f"  window: {open_time} → {close_time}  ({close_time - open_time}s)")
 
-                secs_left = close_time - time.time()
+                # ── 3-SECOND REFRESH POLLING ──────────────────────────────────
+                # Poll every 3 seconds, log status, until we hit entry window
+                while True:
+                    now_ts = time.time()
+                    secs_left = close_time - now_ts
 
-                # ── Wait until entry window (last 1 second) ───────────────────
-                wait_until_entry = secs_left - ENTRY_WINDOW_SEC
-                if wait_until_entry > 0:
-                    # Sleep until just before entry window, checking every 0.5s
-                    print(f"  {secs_left:.1f}s left — waiting for entry window…")
-                    while time.time() < close_time - ENTRY_WINDOW_SEC:
-                        await asyncio.sleep(min(0.5, max(close_time - ENTRY_WINDOW_SEC - time.time(), 0)))
+                    if secs_left <= ENTRY_WINDOW_SEC:
+                        break  # enter fast-poll entry window
+
+                    # Fetch spot + log every 3 seconds
+                    spot = await get_btc_spot(client)
+                    diff = spot - price_to_beat
+                    up_price   = up_market.get("pricing", {}).get("buyYesPriceUsd", 0) / 1_000_000
+                    down_price = down_market.get("pricing", {}).get("buyYesPriceUsd", 0) / 1_000_000
+
+                    print(
+                        f"[LIVE] {secs_left:.0f}s left | "
+                        f"spot=${spot:,.2f} | "
+                        f"target=${price_to_beat:,.2f} | "
+                        f"diff={diff:+.2f} | "
+                        f"UP=${up_price:.3f} DOWN=${down_price:.3f}"
+                    )
+
+                    # Sleep 3 seconds (or less if close to entry window)
+                    sleep_time = min(REFRESH_INTERVAL, max(secs_left - ENTRY_WINDOW_SEC, 0.1))
+                    await asyncio.sleep(sleep_time)
 
                 # ── ENTRY WINDOW: poll every 250ms ────────────────────────────
+                print(f"[ENTRY WINDOW] Last 1 second — fast polling…")
                 entered = False
                 while time.time() < close_time:
                     spot = await get_btc_spot(client)
                     diff = spot - price_to_beat
-                    print(f"  spot=${spot:,.2f}  ptb=${price_to_beat:,.2f}  diff={diff:+.2f}")
+                    print(f"  spot=${spot:,.2f}  target=${price_to_beat:,.2f}  diff={diff:+.2f}")
 
                     if diff >= THRESHOLD_USD:
-                        side      = "UP"
-                        market    = up_market
-                        is_up     = True
+                        side, market, is_up = "UP", up_market, True
                     elif diff <= -THRESHOLD_USD:
-                        side      = "DOWN"
-                        market    = down_market
-                        is_up     = False
+                        side, market, is_up = "DOWN", down_market, False
                     else:
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
@@ -270,15 +297,15 @@ async def main():
                         traded_markets.add(event_id)
                         entered = True
                     else:
-                        print("[RETRY] Order failed — will retry next round")
-                        traded_markets.add(event_id)  # don't retry same round
+                        print("[FAIL] Order failed — skipping this round")
+                        traded_markets.add(event_id)
                     break
 
                 if not entered:
                     print("[PASS] Threshold not met — skipping round.")
                     traded_markets.add(event_id)
 
-                # Reset price_to_beat for next round
+                # Reset for next round
                 price_to_beat = None
                 await asyncio.sleep(3)
 
