@@ -1,30 +1,46 @@
 """
 Jupiter Predict — BTC Up or Down 5m Bot
-Strategy: In the last 1 second of a round,
-  if BTC spot price >= (price_to_beat + 5) → BUY UP  (100% of balance)
-  if BTC spot price <= (price_to_beat - 5) → BUY DOWN (100% of balance)
-  else → skip
+═══════════════════════════════════════════════════════════════════════════════
+
+Strategy:
+  • Monitor live "Bitcoin Up/Down (5m)" markets on Jupiter Forecast (provider=bisonfi)
+  • Record BTC spot price at market open  →  that's the "price to beat"
+  • In the LAST 1 SECOND of the round, poll BTC spot price every 250ms:
+      - If spot >= price_to_beat + $5  →  BUY UP   (100% of USDC balance)
+      - If spot <= price_to_beat - $5  →  BUY DOWN (100% of USDC balance)
+      - Otherwise  →  skip this round
+  • One trade per round, never double-enters
+
+BTC spot price: Jupiter Price API v3 (wBTC on Solana)
+Resolution:     Chainlink BTC/USD data stream (per market rules)
+
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 import os
 import time
 import base64
 import asyncio
+from datetime import datetime, timezone
+
 import httpx
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-JUPITER_API_KEY  = os.environ["JUPITER_API_KEY"]
-WALLET_PRIVKEY   = os.environ["WALLET_PRIVKEY"]          # base58 private key
-SOLANA_RPC       = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-THRESHOLD_USD    = 5.0        # $5 deviation from price-to-beat triggers entry
-POLL_INTERVAL    = 0.25       # seconds between spot-price polls in final window
-ENTRY_WINDOW_SEC = 1.0        # enter only inside last N seconds of round
+JUPITER_API_KEY   = os.environ["JUPITER_API_KEY"]
+WALLET_PRIVKEY    = os.environ["WALLET_PRIVKEY"]
+SOLANA_RPC        = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+THRESHOLD_USD     = 5.0       # $5 deviation triggers entry
+POLL_INTERVAL     = 0.25      # seconds between spot-price polls in entry window
+ENTRY_WINDOW_SEC  = 1.0       # enter only inside last N seconds of round
 
-JUP_BASE   = "https://api.jup.ag/prediction/v1"
-PRICE_URL  = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112"  # SOL; BTC below
-BTC_PRICE_URL = "https://api.jup.ag/price/v2?ids=9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"  # BTC via Jupiter
+# wBTC mint on Solana — Jupiter Price v3 returns real BTC USD price for this
+WBTC_MINT = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+JUP_PREDICT_BASE = "https://api.jup.ag/prediction/v1"
+JUP_PRICE_V3      = f"https://api.jup.ag/price/v3?ids={WBTC_MINT}"
 
 HEADERS = {
     "x-api-key": JUPITER_API_KEY,
@@ -32,53 +48,55 @@ HEADERS = {
 }
 
 # ─── WALLET ────────────────────────────────────────────────────────────────────
-keypair = Keypair.from_base58_string(WALLET_PRIVKEY)
+keypair     = Keypair.from_base58_string(WALLET_PRIVKEY)
 OWNER_PUBKEY = str(keypair.pubkey())
 print(f"[WALLET] {OWNER_PUBKEY}")
 
-# ─── HELPERS ───────────────────────────────────────────────────────────────────
-async def get_active_btc_market(client: httpx.AsyncClient) -> dict | None:
-    """Fetch the current live BTC Up/Down 5m market from Jupiter Forecast."""
+# ─── STATE ─────────────────────────────────────────────────────────────────────
+# Track which market we've already traded and the opening price
+traded_markets: set[str] = set()
+price_to_beat: float | None = None
+
+
+# ─── API CALLS ─────────────────────────────────────────────────────────────────
+async def get_btc_5m_market(client: httpx.AsyncClient) -> dict | None:
+    """
+    Fetch the current Bitcoin Up/Down 5m market from Jupiter Forecast.
+    Returns the event dict or None.
+    """
     r = await client.get(
-        f"{JUP_BASE}/events",
+        f"{JUP_PREDICT_BASE}/events",
         params={
+            "filter": "live",
             "provider": "bisonfi",
-            "category": "crypto",
-            "filter": "active",
             "includeMarkets": "true",
-            "query": "BTC",
         },
         headers=HEADERS,
     )
     r.raise_for_status()
-    events = r.json().get("events", [])
+    data = r.json()
+    events = data.get("data", [])
+
     for event in events:
-        title = event.get("title", "").lower()
-        if "btc" in title and ("up or down" in title or "5m" in title):
-            markets = event.get("markets", [])
-            if markets:
-                return event
+        meta = event.get("metadata", {})
+        title = meta.get("title", "")
+        series = meta.get("series", "")
+        if series == "btc" and "5m" in title.lower():
+            return event
     return None
 
 
 async def get_btc_spot(client: httpx.AsyncClient) -> float:
-    """Get BTC spot price from Jupiter Price API v2."""
-    # BTC mint on Solana: 9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E (wrapped BTC)
-    r = await client.get(BTC_PRICE_URL)
+    """Get BTC spot price from Jupiter Price API v3 (wBTC on Solana)."""
+    r = await client.get(JUP_PRICE_V3)
     r.raise_for_status()
     data = r.json()
-    price_str = (
-        data.get("data", {})
-        .get("9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", {})
-        .get("price", "0")
-    )
-    return float(price_str)
+    price = data[WBTC_MINT]["usdPrice"]
+    return float(price)
 
 
 async def get_usdc_balance(client: httpx.AsyncClient) -> int:
     """Return USDC balance in micro-USDC (1 USDC = 1_000_000)."""
-    # Use Solana RPC getTokenAccountsByOwner for USDC
-    USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
@@ -97,124 +115,168 @@ async def get_usdc_balance(client: httpx.AsyncClient) -> int:
     return int(amount)
 
 
-async def place_order(client: httpx.AsyncClient, market_id: str, outcome: str, amount_micro: int) -> str | None:
-    """Place a market buy order. Returns order pubkey or None on failure."""
+async def place_order(
+    client: httpx.AsyncClient,
+    market_id: str,
+    is_up: bool,
+    amount_micro: int,
+) -> str | None:
+    """
+    Place a market buy order via Jupiter Predict API.
+    Returns order pubkey on success, None on failure.
+    """
     body = {
         "marketId": market_id,
-        "outcome": outcome,          # "YES" = UP, "NO" = DOWN
+        "outcome": "YES",          # buying YES shares for the chosen side
+        "isBuy": True,
         "depositAmount": str(amount_micro),
         "ownerPubkey": OWNER_PUBKEY,
     }
-    r = await client.post(f"{JUP_BASE}/orders", json=body, headers=HEADERS)
+    r = await client.post(
+        f"{JUP_PREDICT_BASE}/orders", json=body, headers=HEADERS
+    )
     if r.status_code != 200:
-        print(f"[ORDER ERROR] {r.status_code} {r.text}")
+        print(f"[ORDER ERROR] {r.status_code} {r.text[:300]}")
         return None
 
-    data       = r.json()
-    tx_b64     = data["transaction"]
-    order_pk   = data["orderPubkey"]
+    data     = r.json()
+    tx_b64   = data.get("transaction")
+    order_pk = data.get("orderPubkey")
 
-    # Sign & send
-    tx_bytes   = base64.b64decode(tx_b64)
-    tx         = VersionedTransaction.from_bytes(tx_bytes)
-    signed_tx  = keypair.sign_message(bytes(tx.message))   # sign message
-    # Reconstruct signed VersionedTransaction
-    signed_vtx = VersionedTransaction([signed_tx], tx.message)
+    if not tx_b64 or not order_pk:
+        print(f"[ORDER] Unexpected response: {data}")
+        return None
+
+    # ── Sign & send the VersionedTransaction ────────────────────────────────
+    tx_bytes  = base64.b64decode(tx_b64)
+    tx        = VersionedTransaction.from_bytes(tx_bytes)
+    signed    = keypair.sign_message(bytes(tx.message))
+    signed_tx = VersionedTransaction([signed], tx.message)
 
     send_payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "sendTransaction",
         "params": [
-            base64.b64encode(bytes(signed_vtx)).decode(),
+            base64.b64encode(bytes(signed_tx)).decode(),
             {"encoding": "base64", "skipPreflight": False, "maxRetries": 3},
         ],
     }
     rpc_r = await client.post(SOLANA_RPC, json=send_payload)
     rpc_r.raise_for_status()
     result = rpc_r.json()
+
     if "error" in result:
         print(f"[RPC ERROR] {result['error']}")
         return None
 
     sig = result["result"]
-    print(f"[TX SENT] sig={sig}  order={order_pk}  outcome={outcome}  amount={amount_micro/1e6:.4f} USDC")
+    side = "UP" if is_up else "DOWN"
+    print(f"[TX SENT] sig={sig}  order={order_pk}  side={side}  amount={amount_micro/1e6:.4f} USDC")
     return order_pk
 
 
 # ─── MAIN LOOP ─────────────────────────────────────────────────────────────────
 async def main():
+    global price_to_beat
+
     async with httpx.AsyncClient(timeout=5.0) as client:
-        last_market_id = None
 
         while True:
             try:
-                event = await get_active_btc_market(client)
+                event = await get_btc_5m_market(client)
                 if not event:
-                    print("[WAIT] No active BTC 5m market found. Retrying in 5s…")
+                    print("[WAIT] No active BTC 5m market. Retrying in 5s…")
                     await asyncio.sleep(5)
                     continue
 
-                market     = event["markets"][0]
-                market_id  = market["id"]
-                end_time   = market.get("endTime") or event.get("endTime")  # ISO or unix ms
-                price_to_beat = float(event.get("priceToBeat") or market.get("priceToBeat") or 0)
+                meta      = event.get("metadata", {})
+                event_id  = event.get("eventId", "")
+                title     = meta.get("title", "")
+                markets   = event.get("markets", [])
 
-                # Parse end_time to unix seconds
-                if isinstance(end_time, str):
-                    from datetime import datetime, timezone
-                    end_ts = datetime.fromisoformat(end_time.replace("Z", "+00:00")).timestamp()
-                else:
-                    end_ts = int(end_time) / 1000 if end_time > 1e12 else int(end_time)
+                # Find UP and DOWN market objects
+                up_market   = next((m for m in markets if m.get("outcomeSide") == "up"),   None)
+                down_market = next((m for m in markets if m.get("outcomeSide") == "down"), None)
 
-                now = time.time()
-                secs_left = end_ts - now
+                if not up_market or not down_market:
+                    print(f"[ERR] Could not find UP/DOWN markets in {title}")
+                    await asyncio.sleep(5)
+                    continue
 
-                if market_id == last_market_id:
-                    # Already traded this round — wait for next
-                    wait = max(secs_left + 2, 2)
-                    print(f"[SKIP] Already traded market {market_id}. Waiting {wait:.1f}s for next round.")
+                # Use UP market's timing (both share the same window)
+                close_time = up_market.get("closeTime")  # unix seconds
+                open_time  = up_market.get("openTime")   # unix seconds
+
+                # Already traded this market?
+                if event_id in traded_markets:
+                    secs_left = close_time - time.time()
+                    wait = max(secs_left + 3, 2)
+                    print(f"[SKIP] Already traded {event_id}. Waiting {wait:.0f}s for next round.")
                     await asyncio.sleep(min(wait, 10))
                     continue
 
-                print(f"[MARKET] id={market_id}  price_to_beat=${price_to_beat:.2f}  ends_in={secs_left:.1f}s")
+                # ── Capture price-to-beat when market first appears ───────────
+                now_ts = time.time()
+                if price_to_beat is None:
+                    price_to_beat = await get_btc_spot(client)
+                    print(f"[NEW ROUND] {title}")
+                    print(f"  event={event_id}")
+                    print(f"  price_to_beat=${price_to_beat:,.2f}")
+                    print(f"  window: {open_time} → {close_time}  ({close_time - open_time}s)")
 
-                # Wait until we're in the entry window (last 1 second)
+                secs_left = close_time - time.time()
+
+                # ── Wait until entry window (last 1 second) ───────────────────
                 wait_until_entry = secs_left - ENTRY_WINDOW_SEC
                 if wait_until_entry > 0:
-                    await asyncio.sleep(wait_until_entry - 0.05)  # wake up just before
+                    # Sleep until just before entry window, checking every 0.5s
+                    print(f"  {secs_left:.1f}s left — waiting for entry window…")
+                    while time.time() < close_time - ENTRY_WINDOW_SEC:
+                        await asyncio.sleep(min(0.5, max(close_time - ENTRY_WINDOW_SEC - time.time(), 0)))
 
-                # ── ENTRY WINDOW ──────────────────────────────────────────────
+                # ── ENTRY WINDOW: poll every 250ms ────────────────────────────
                 entered = False
-                while time.time() < end_ts:
+                while time.time() < close_time:
                     spot = await get_btc_spot(client)
                     diff = spot - price_to_beat
-                    print(f"  spot=${spot:.2f}  ptb=${price_to_beat:.2f}  diff={diff:+.2f}")
+                    print(f"  spot=${spot:,.2f}  ptb=${price_to_beat:,.2f}  diff={diff:+.2f}")
 
                     if diff >= THRESHOLD_USD:
-                        outcome = "YES"   # UP
+                        side      = "UP"
+                        market    = up_market
+                        is_up     = True
                     elif diff <= -THRESHOLD_USD:
-                        outcome = "NO"    # DOWN
+                        side      = "DOWN"
+                        market    = down_market
+                        is_up     = False
                     else:
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
 
+                    # ── Place the order ──────────────────────────────────────
                     balance = await get_usdc_balance(client)
-                    if balance < 10_000:  # less than $0.01 USDC
-                        print("[SKIP] Balance too low.")
+                    if balance < 10_000:  # less than $0.01
+                        print("[SKIP] USDC balance too low.")
                         break
 
-                    print(f"[ENTRY] outcome={outcome}  balance={balance/1e6:.4f} USDC")
-                    order_pk = await place_order(client, market_id, outcome, balance)
+                    market_id = market.get("marketId")
+                    print(f"[ENTRY] side={side}  market={market_id}  balance={balance/1e6:.4f} USDC")
+                    order_pk = await place_order(client, market_id, is_up, balance)
+
                     if order_pk:
-                        last_market_id = market_id
+                        traded_markets.add(event_id)
                         entered = True
-                    break  # one trade per round regardless
+                    else:
+                        print("[RETRY] Order failed — will retry next round")
+                        traded_markets.add(event_id)  # don't retry same round
+                    break
 
                 if not entered:
-                    print("[PASS] Threshold not met — skipping this round.")
-                    last_market_id = market_id  # don't retry same round
+                    print("[PASS] Threshold not met — skipping round.")
+                    traded_markets.add(event_id)
 
-                # Brief pause then loop to pick up next market
+                # Reset price_to_beat for next round
+                price_to_beat = None
                 await asyncio.sleep(3)
 
             except Exception as e:
