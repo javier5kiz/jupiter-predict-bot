@@ -18,6 +18,7 @@ Resolution:     Chainlink BTC/USD data stream (per market rules)
 """
 
 import os
+import re
 import time
 import base64
 import asyncio
@@ -63,6 +64,8 @@ async def get_btc_5m_market(client: httpx.AsyncClient) -> dict | None:
     """
     Fetch the current Bitcoin Up/Down 5m market from Jupiter Forecast.
     Returns the event dict or None.
+
+    Uses regex to match "(5m)" exactly — NOT "(15m)" which also contains "5m".
     """
     r = await client.get(
         f"{JUP_PREDICT_BASE}/events",
@@ -81,7 +84,7 @@ async def get_btc_5m_market(client: httpx.AsyncClient) -> dict | None:
         meta = event.get("metadata", {})
         title = meta.get("title", "")
         series = meta.get("series", "")
-        if series == "btc" and "5m" in title.lower():
+        if series == "btc" and re.search(r'\(5m\)', title, re.IGNORECASE):
             return event
     return None
 
